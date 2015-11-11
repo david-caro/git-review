@@ -71,6 +71,7 @@ class colors(object):
     yellow = '\033[33m'
     green = '\033[92m'
     reset = '\033[0m'
+    blue = '\033[36m'
 
 
 class GitReviewException(Exception):
@@ -981,18 +982,18 @@ def list_reviews(remote):
         print("No pending reviews")
         return
 
-    REVIEW_FIELDS = ('number', 'branch', 'subject')
+    REVIEW_FIELDS = ('number', 'branch', 'topic', 'subject')
     FIELDS = range(len(REVIEW_FIELDS))
     if check_use_color_output():
-        review_field_color = (colors.yellow, colors.green, "")
+        review_field_color = (colors.yellow, colors.green, colors.blue, "")
         color_reset = colors.reset
     else:
-        review_field_color = ("", "", "")
+        review_field_color = ("", "", "", "")
         color_reset = ""
-    review_field_format = ["%*s", "%*s", "%*s"]
-    review_field_justify = [+1, +1, -1]  # +1 is justify to right
+    review_field_format = ["%*s", "%*s", "%*s", "%*s"]
+    review_field_justify = [+1, +1, +1, -1]  # +1 is justify to right
 
-    review_list = [[r[f] for f in REVIEW_FIELDS] for r in reviews]
+    review_list = [[r.get(f, '-') for f in REVIEW_FIELDS] for r in reviews]
     review_field_width = dict()
     # assume last field is longest and may exceed the console width in which
     # case using the maximum value will result in extra blank lines appearing
