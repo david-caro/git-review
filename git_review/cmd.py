@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# encoding: utf-8
 from __future__ import print_function
 
 COPYRIGHT = """\
@@ -27,6 +28,7 @@ import shlex
 import subprocess
 import sys
 import textwrap
+from collections import OrderedDict as OD
 
 import pkg_resources
 import requests
@@ -538,7 +540,8 @@ def parse_gerrit_ssh_params_from_git_url(git_url):
 
 
 def query_reviews(remote_url, change=None, current_patch_set=True,
-                  exception=CommandFailed, parse_exc=Exception):
+                  exception=CommandFailed, parse_exc=Exception,
+                  dependencies=False):
     if remote_url.startswith('http://') or remote_url.startswith('https://'):
         query = query_reviews_over_http
     else:
@@ -547,11 +550,14 @@ def query_reviews(remote_url, change=None, current_patch_set=True,
                  change=change,
                  current_patch_set=current_patch_set,
                  exception=exception,
-                 parse_exc=parse_exc)
+                 parse_exc=parse_exc,
+                 dependencies=dependencies)
 
 
 def query_reviews_over_http(remote_url, change=None, current_patch_set=True,
-                            exception=CommandFailed, parse_exc=Exception):
+                            exception=CommandFailed, parse_exc=Exception,
+                            dependencies=False):
+    # TODO: Implement the dependencies
     url = urljoin(remote_url, '/changes/')
     if change:
         if current_patch_set:
@@ -591,7 +597,8 @@ def query_reviews_over_http(remote_url, change=None, current_patch_set=True,
 
 
 def query_reviews_over_ssh(remote_url, change=None, current_patch_set=True,
-                           exception=CommandFailed, parse_exc=Exception):
+                           exception=CommandFailed, parse_exc=Exception,
+                           dependencies=False):
     (hostname, username, port, project_name) = \
         parse_gerrit_ssh_params_from_git_url(remote_url)
 
@@ -602,6 +609,8 @@ def query_reviews_over_ssh(remote_url, change=None, current_patch_set=True,
             query = "--patch-sets change:%s" % change
     else:
         query = "project:%s status:open" % project_name
+    if dependencies:
+        query += " --dependencies"
 
     port_data = "p%s" % port if port is not None else ""
     if username is None:
@@ -972,66 +981,186 @@ class CannotParseOpenChangesets(ChangeSetException):
     EXIT_CODE = 33
 
 
+class Review(object):
+    def __init__(self, number, branch, topic, subject, deps=None,
+                 json_data=None):
+        self.number = number
+        self.branch = branch
+        self.topic = topic
+        self.subject = subject
+        self.deps = deps or []
+        self.json_data = json_data
+
+    @classmethod
+    def from_json(cls, json_data):
+        return cls(
+            number=json_data['number'],
+            branch=json_data.get('branch', '-'),
+            topic=json_data.get('topic', '-'),
+            subject=json_data.get('subject', '-'),
+            json_data=json_data,
+        )
+
+    def add_dependent(self, dependent_change):
+        self.deps.append(dependent_change)
+
+    def get_attrs(self, attrs):
+        return [getattr(self, attr) for attr in attrs]
+
+    def __repr__(self):
+        return str(self.json_data)
+
+
+def resolve_review_tree(reviews):
+    deptree = []
+    open_reviews_by_id = dict([(r.number, r) for r in reviews])
+    for review in reviews:
+        depends_on = review.json_data.get(
+            'dependsOn', [{'number': None}])[0]['number']
+        if depends_on in open_reviews_by_id:
+            open_reviews_by_id[depends_on].add_dependent(review)
+        else:
+            deptree.append(review)
+    return deptree
+
+
+def get_review_tree_depth(review_tree):
+    max_depth = 0
+    for review in review_tree:
+        if review.deps:
+            depth = get_review_tree_depth(review.deps) + 1
+            if depth > max_depth:
+                max_depth = depth
+    return max_depth
+
+
+class ReviewsPrinter(object):
+    def __init__(self, with_topic=False):
+        if with_topic:
+            self.fields = ('number', 'branch', 'topic', 'subject')
+        else:
+            self.fields = ('number', 'branch', 'subject')
+
+        self.fields_format = ["%*s"] * len(self.fields)
+        # +1 is justify to right
+        self.fields_justify = [-1] + [+1] * len(self.fields) + [-1]
+
+        if check_use_color_output():
+            self.fields_colors = (
+                colors.yellow, colors.green, colors.blue, "")
+            self.color_reset = colors.reset
+        else:
+            self.fields_color = ("", "", "", "")
+            self.color_reset = ""
+        self.fields_width = OD(zip(self.fields, (1,) * len(self.fields)))
+        self.reviews = []
+
+    def _get_field_format_str(self, field):
+        index = self.fields.index(field)
+        return (
+            self.fields_colors[index] +
+            self.fields_format[index] +
+            self.color_reset
+        )
+
+    def add_review(self, review):
+        self.reviews.append(review)
+        for field in self.fields:
+            self.fields_width[field] = max((
+                self.fields_width.get(field, 0),
+                len(getattr(review, field)),
+            ))
+
+    def _get_fields_format_str(self):
+        return "  ".join([
+            self._get_field_format_str(field)
+            for field in self.fields])
+
+    def print_review(self, review, dep_str='', last_dep=False, has_parent=True):
+        fields_format_str = self._get_fields_format_str()
+
+        if has_parent:
+            dep_char = u'└' if last_dep else u'├'
+        else:
+            dep_char = ''
+        prefix_str = dep_str + dep_char
+
+        formatted_fields = []
+        index = 0
+        for field, width in self.fields_width.items():
+            formatted_fields.extend((
+                width * self.fields_justify[index],
+                getattr(review, field).encode('utf-8')
+            ))
+            index += 1
+
+        formatted_fields[1] = prefix_str + formatted_fields[1]
+        print(fields_format_str % tuple(formatted_fields))
+
+    def _do_print(self, reviews, with_deps=False,
+                  dep_str=''):
+        total_reviews = len(reviews)
+        for index, review in enumerate(reviews):
+            last_dep = (index + 1) == total_reviews
+            has_parent = len(dep_str) > 0
+            self.print_review(
+                review,
+                dep_str=dep_str,
+                last_dep=last_dep,
+                has_parent=has_parent,
+            )
+            if with_deps and review.deps:
+                if not last_dep and has_parent:
+                    next_dep_str = dep_str + '|'
+                else:
+                    next_dep_str = dep_str + ' '
+                self._do_print(review.deps, with_deps=True,
+                               dep_str=next_dep_str)
+
+    def do_print(self, reviews, with_deps=False, dep_str=''):
+
+        self.fields_width[self.fields[-1]] = 1
+        total_reviews = len(reviews)
+
+        if with_deps:
+            reviews = resolve_review_tree(reviews)
+            max_depth = get_review_tree_depth(reviews)
+            self.fields_width[self.fields[0]] += max_depth + 1
+
+        self._do_print(reviews, with_deps, dep_str)
+        print("Found %d items for review" % total_reviews)
+
+
 def list_reviews(remote, verbosity=1):
     remote_url = get_remote_url(remote)
-    reviews = query_reviews(remote_url,
-                            exception=CannotQueryOpenChangesets,
-                            parse_exc=CannotParseOpenChangesets)
+
+    with_topic = with_deps = False
+    if verbosity == 2:
+        with_topic = True
+        with_deps = False
+    elif verbosity > 2:
+        with_topic = with_deps = True
+
+    reviews = [
+        Review.from_json(r)
+        for r in
+        query_reviews(
+            remote_url,
+            exception=CannotQueryOpenChangesets,
+            parse_exc=CannotParseOpenChangesets,
+            dependencies=with_deps,
+        )
+    ]
 
     if not reviews:
         print("No pending reviews")
         return
 
-    if verbosity == 1:
-        REVIEW_FIELDS = ('number', 'branch', 'subject')
-    else:
-        REVIEW_FIELDS = ('number', 'branch', 'topic', 'subject')
+    printer = ReviewsPrinter(with_topic=with_topic)
+    for review in reviews:
+        printer.add_review(review)
 
-    FIELDS = range(len(REVIEW_FIELDS))
-    if check_use_color_output():
-        if verbosity == 1:
-            review_field_color = (colors.yellow, colors.green, "")
-        else:
-            review_field_color = (colors.yellow, colors.green, colors.blue, "")
-        color_reset = colors.reset
-    else:
-        review_field_color = ("",) * len(REVIEW_FIELDS)
-        color_reset = ""
-    review_field_format = ["%*s"] * len(REVIEW_FIELDS)
-    # +1 is justify to right
-    review_field_justify = [+1] * (len(REVIEW_FIELDS) -1) + [-1]
-
-    review_list = [[r.get(f, '-') for f in REVIEW_FIELDS] for r in reviews]
-    review_field_width = dict()
-    # assume last field is longest and may exceed the console width in which
-    # case using the maximum value will result in extra blank lines appearing
-    # after each entry even when only one field exceeds the console width
-    for i in FIELDS[:-1]:
-        review_field_width[i] = max(len(r[i]) for r in review_list)
-    review_field_width[len(FIELDS) - 1] = 1
-
-    review_field_format = "  ".join([
-        review_field_color[i] +
-        review_field_format[i] +
-        color_reset
-        for i in FIELDS])
-
-    review_field_width = [
-        review_field_width[i] * review_field_justify[i]
-        for i in FIELDS]
-    for review_value in review_list:
-        # At this point we have review_field_format
-        # like "%*s %*s %*s" and we need to supply
-        # (width1, value1, width2, value2, ...) tuple to print
-        # It's easy to zip() widths with actual values,
-        # but we need to flatten the resulting
-        #  ((width1, value1), (width2, value2), ...) map.
-        formatted_fields = []
-        for (width, value) in zip(review_field_width, review_value):
-            formatted_fields.extend([width, value.encode('utf-8')])
-        print(review_field_format % tuple(formatted_fields))
-    print("Found %d items for review" % len(reviews))
-
+    printer.do_print(reviews, with_deps=with_deps)
     return 0
 
 
